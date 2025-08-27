@@ -1,0 +1,19 @@
+menu "Gateway Settings"
+
+config GW_API_KEY
+	string "AWS API key (x-api-key)"
+	default ""
+
+config GW_DEVICE_ID
+	string "Gateway Device ID"
+	default "GW123"
+
+config GW_URL_LATEST
+	string "GET latest command URL"
+	default "https://hx8jy3vf48.execute-api.eu-central-1.amazonaws.com/dev/latest-command"
+	
+	config GW_URL_STATUS
+    string "POST device status URL"
+    default "https://hx8jy3vf48.execute-api.eu-central-1.amazonaws.com/dev/device-status"
+
+endmenu

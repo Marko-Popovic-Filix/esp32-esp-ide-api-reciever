@@ -1,0 +1,8 @@
+config GW_ENABLE_STATUS
+    bool "Enable status reporting (POST)"
+    default n
+
+config GW_URL_STATUS
+    string "POST device status URL"
+    default ""
+    depends on GW_ENABLE_STATUS
