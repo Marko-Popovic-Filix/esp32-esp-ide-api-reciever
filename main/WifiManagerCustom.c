@@ -1,9 +1,8 @@
 // main/WifiManagerCustom.c
-// Wi-Fi manager with setup portal + robust double-reset via NVS latch
+// Wi-Fi manager with setup portal
 // - First boot (no creds): SoftAP "GW-Setup-XXXX" + web portal at http://192.168.4.1
 // - After submit SSID/PASS: saves to NVS, switches to STA, connects
-// - Double-tap RESET (two reboots within 5s): clears saved Wi-Fi (NVS) and reboots into setup
-// - Optional: hold BOOT (GPIO0) ~3s at power-up to clear Wi-Fi
+// - Clears Wi-Fi ONLY if BOOT (GPIO0) is held ~3s at power-up
 
 #include <string.h>
 #include <stdlib.h>
@@ -14,7 +13,6 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
@@ -24,18 +22,13 @@
 
 #include "esp_http_server.h"
 #include "lwip/inet.h"
-#include "driver/gpio.h"     // for optional hold-BOOT reset
+#include "driver/gpio.h"     // BOOT (GPIO0) hold-to-clear
 
 static const char *TAG = "WiFiMgr";
 
 #define NVS_NS     "gwcfg"
 #define KEY_SSID   "ssid"
 #define KEY_PASS   "pass"
-
-// Double-reset latch keys (in NVS)
-#define DR_KEY_FLAG   "drf"   // u8 {0,1}
-#define DR_KEY_TIME   "drt"   // u64 (us)
-#define DOUBLE_RESET_WINDOW_US (5ULL * 1000000ULL)  // 5 seconds
 
 static EventGroupHandle_t s_evt;
 #define WIFI_CONNECTED_BIT BIT0
@@ -46,7 +39,7 @@ static httpd_handle_t s_server = NULL;
 static esp_netif_t *s_netif_sta = NULL;
 static esp_netif_t *s_netif_ap  = NULL;
 
-// ====== tiny helpers ======
+/* ---------- tiny helpers ---------- */
 static int from_hex(char c){
     if(c>='0'&&c<='9')return c-'0';
     if(c>='a'&&c<='f')return c-'a'+10;
@@ -63,7 +56,7 @@ static void url_decode(char *s){
     *o=0;
 }
 
-// ====== NVS creds ======
+/* ---------- NVS creds ---------- */
 static bool load_creds(char *ssid, size_t ssid_sz, char *pass, size_t pass_sz){
     nvs_handle_t h;
     if(nvs_open(NVS_NS, NVS_READONLY, &h)!=ESP_OK) return false;
@@ -80,6 +73,7 @@ static esp_err_t save_creds(const char *ssid, const char *pass){
     ESP_ERROR_CHECK(nvs_set_str(h, KEY_PASS, pass));
     esp_err_t err = nvs_commit(h);
     nvs_close(h);
+    ESP_LOGI(TAG, "Wi-Fi creds saved to NVS (ssid='%s')", ssid);
     return err;
 }
 static void erase_saved_wifi(void){
@@ -93,37 +87,7 @@ static void erase_saved_wifi(void){
     }
 }
 
-// ====== Double-reset via NVS latch (works with EN/RESET) ======
-static void double_reset_check_and_handle(void){
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-
-    uint8_t flag = 0;
-    uint64_t last = 0;
-    esp_err_t eflag = nvs_get_u8(h, DR_KEY_FLAG, &flag);
-    esp_err_t etime = nvs_get_u64(h, DR_KEY_TIME, &last);
-    uint64_t now = esp_timer_get_time();
-
-    bool armed = (eflag == ESP_OK && flag == 1 && etime == ESP_OK);
-    if (armed && (now - last) < DOUBLE_RESET_WINDOW_US) {
-        // Double reset detected
-        ESP_LOGW(TAG, "Double RESET detected -> clearing Wi-Fi creds and rebooting");
-        nvs_set_u8(h, DR_KEY_FLAG, 0);
-        nvs_commit(h);
-        nvs_close(h);
-        erase_saved_wifi();
-        vTaskDelay(pdMS_TO_TICKS(200));
-        esp_restart();
-    } else {
-        // (Re)arm latch for the next boot
-        nvs_set_u8(h, DR_KEY_FLAG, 1);
-        nvs_set_u64(h, DR_KEY_TIME, now);
-        nvs_commit(h);
-        nvs_close(h);
-    }
-}
-
-// ====== Wi-Fi events ======
+/* ---------- Wi-Fi events ---------- */
 static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data){
     if(base==WIFI_EVENT && id==WIFI_EVENT_STA_START){
         esp_wifi_connect(); // kick off STA connect
@@ -147,7 +111,7 @@ static void on_ip(void *arg, esp_event_base_t base, int32_t id, void *data){
     }
 }
 
-// ====== HTTP setup portal ======
+/* ---------- HTTP setup portal ---------- */
 static const char *HTML_FORM =
 "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'/>"
 "<title>ESP32 Gateway Setup</title>"
@@ -238,7 +202,7 @@ static void start_http_server(void){
     }
 }
 
-// ====== SoftAP (setup) ======
+/* ---------- SoftAP (setup) ---------- */
 static void start_portal(void){
     if (s_netif_ap == NULL) s_netif_ap = esp_netif_create_default_wifi_ap();
 
@@ -261,15 +225,11 @@ static void start_portal(void){
     start_http_server();
 }
 
-// ====== Public API ======
+/* ---------- Public API ---------- */
 void wifi_manager_start(void){
     s_evt = xEventGroupCreate();
 
-    // Handle double-reset via NVS latch (works with EN/RESET)
-    double_reset_check_and_handle();
-
     // Optional: hold BOOT (GPIO0) ~3s at boot to clear Wi-Fi
-#if 1
     gpio_config_t io = {
         .pin_bit_mask = 1ULL << 0, // GPIO0
         .mode = GPIO_MODE_INPUT,
@@ -287,7 +247,6 @@ void wifi_manager_start(void){
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
     }
-#endif
 
     // Base init (idempotent)
     esp_err_t err;
@@ -297,7 +256,7 @@ void wifi_manager_start(void){
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
 
-    // Make driver NOT persist its own copy; we manage creds in NVS ourselves
+    // We manage creds in NVS ourselves
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi, NULL, NULL));
@@ -318,7 +277,7 @@ void wifi_manager_start(void){
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
         ESP_ERROR_CHECK(esp_wifi_start());     // start AFTER config
-        // Do NOT call esp_wifi_connect() here; on_wifi handles it on STA_START
+        // STA_START -> on_wifi() -> esp_wifi_connect()
     }else{
         start_portal();
     }

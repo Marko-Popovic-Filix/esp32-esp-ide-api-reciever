@@ -1,218 +1,358 @@
-// main.c ??? ESP32 Gateway (poll-only)
-// - Uses WifiManagerCustom for Wi-Fi provisioning / saved creds
-// - HTTPS GET to fetch the latest command JSON
-// - Optional x-api-key header (leave blank in menuconfig if not used)
-// - Status POST is disabled by default (guarded by CONFIG_GW_ENABLE_STATUS)
-
+// main/main.c
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "esp_log.h"
-#include "esp_err.h"
-#include "esp_event.h"
-#include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+
+#include "nvs.h"
 #include "nvs_flash.h"
 
+#include "esp_event.h"
 #include "esp_http_client.h"
-#include "esp_crt_bundle.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "driver/gpio.h"
 
-#include "sdkconfig.h"
+#include "cJSON.h"
 #include "WifiManagerCustom.h"
 
-static const char *TAG = "GW";
-
-// -------- menuconfig bindings --------
-#define GW_API_KEY     CONFIG_GW_API_KEY       // may be empty
-#define GW_DEVICE_ID   CONFIG_GW_DEVICE_ID
-#define GW_URL_LATEST  CONFIG_GW_URL_LATEST
-
-#if CONFIG_GW_ENABLE_STATUS
-#define GW_URL_STATUS  CONFIG_GW_URL_STATUS
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+#include "esp_crt_bundle.h"
 #endif
 
-// -------- HTTP helpers (GET [+optional x-api-key]) --------
-typedef struct {
-    char *buf;
-    int   len;
-    int   cap;
-} resp_buf_t;
+// ======== Kconfig (menuconfig) ========
+#define GW_API_KEY     CONFIG_GW_API_KEY
+#define GW_DEVICE_ID   CONFIG_GW_DEVICE_ID
+#define GW_URL_LATEST  CONFIG_GW_URL_LATEST
+// No status POST URL on purpose (we're disabling POSTs)
 
-static esp_err_t http_evt_handler(esp_http_client_event_t *evt)
+// ======== Logs ========
+static const char *TAG = "GW";
+
+// ======== GPIO0 long-press to forget Wi-Fi ========
+#define WIFI_RESET_BTN_GPIO   0      // IO0 (BOOT)
+#define BTN_SAMPLE_MS         20
+#define BTN_LONG_MS           3000   // hold ≥ 3s to clear Wi-Fi
+
+static void clear_wifi_credentials_and_reboot(void)
 {
-    resp_buf_t *rb = (resp_buf_t *)evt->user_data;
-    switch (evt->event_id) {
-    case HTTP_EVENT_ON_CONNECTED:
-        if (rb) { rb->len = 0; }
-        break;
-    case HTTP_EVENT_ON_DATA:
-        if (!rb || !evt->data || evt->data_len <= 0) break;
-        if (rb->cap - rb->len < evt->data_len + 1) {
-            int new_cap = rb->cap ? rb->cap : 1024;
-            while (new_cap - rb->len < evt->data_len + 1) new_cap *= 2;
-            char *nb = realloc(rb->buf, new_cap);
-            if (!nb) return ESP_FAIL;
-            rb->buf = nb; rb->cap = new_cap;
-        }
-        memcpy(rb->buf + rb->len, evt->data, evt->data_len);
-        rb->len += evt->data_len;
-        rb->buf[rb->len] = '\0';
-        break;
-    default:
-        break;
+    ESP_LOGW(TAG, "Clearing Wi-Fi creds via esp_wifi_restore() + wiping 'wifi_manager' namespace");
+    // Stop WiFi if running (ignore errors)
+    esp_wifi_stop();
+    // Erase Wi-Fi config that the WiFi stack saved
+    esp_wifi_restore();
+
+    // If your custom manager uses its own NVS namespace, wipe it as well:
+    nvs_handle_t h;
+    if (nvs_open("wifi_manager", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGW(TAG, "Erased NVS namespace 'wifi_manager'");
     }
-    return ESP_OK;
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
 }
 
-static esp_err_t http_get(const char *url, const char *api_key, char **out_body, int *out_status)
+static void wifi_clear_button_task(void *arg)
 {
-    *out_body = NULL;
-    if (out_status) *out_status = -1;
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << WIFI_RESET_BTN_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,   // IO0 is pulled up, press to GND
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io);
 
-    resp_buf_t rb = {0};
+    ESP_LOGI(TAG, "GPIO0 long-press enabled (hold ≥ %d ms to forget Wi-Fi).", BTN_LONG_MS);
+
+    bool prev = true;
+    int64_t t_down_ms = 0;
+
+    while (1) {
+        bool level = gpio_get_level(WIFI_RESET_BTN_GPIO); // 1 = released (pulled up), 0 = pressed
+        if (!level) {
+            if (prev) {
+                // went down now
+                t_down_ms = esp_timer_get_time() / 1000;
+                prev = false;
+            } else {
+                // still down — check duration
+                int64_t held_ms = (esp_timer_get_time() / 1000) - t_down_ms;
+                if (held_ms >= BTN_LONG_MS) {
+                    ESP_LOGW(TAG, "GPIO0 long-press detected -> erase Wi-Fi + reboot");
+                    clear_wifi_credentials_and_reboot();
+                }
+            }
+        } else {
+            // released
+            prev = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(BTN_SAMPLE_MS));
+    }
+}
+
+// ======== Tiny helpers ========
+static uint32_t fnv1a32(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t*)data;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; ++i) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+static void hex32(uint32_t v, char out[9]) {
+    static const char *d = "0123456789abcdef";
+    for (int i=7; i>=0; --i) { out[i] = d[v & 0xF]; v >>= 4; }
+    out[8] = 0;
+}
+
+// ======== HTTP GET only (NO POST) ========
+static esp_err_t http_get(const char *url, const char *api_key, char **out)
+{
+    *out = NULL;
 
     esp_http_client_config_t cfg = {
         .url = url,
         .method = HTTP_METHOD_GET,
-        .event_handler = http_evt_handler,
-        .user_data = &rb,
-        .crt_bundle_attach = esp_crt_bundle_attach, // use IDF root bundle
-        .timeout_ms = 7000,
+        .timeout_ms = 8000,
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+        .crt_bundle_attach = esp_crt_bundle_attach,
+#endif
     };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) return ESP_FAIL;
 
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return ESP_FAIL;
-
-    if (api_key && api_key[0] != '\0') {
-        esp_http_client_set_header(client, "x-api-key", api_key);
+    if (api_key && api_key[0]) {
+        esp_http_client_set_header(c, "x-api-key", api_key);
     }
-    esp_http_client_set_header(client, "Cache-Control", "no-cache");
 
-    esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) {
-        int status = esp_http_client_get_status_code(client);
-        if (out_status) *out_status = status;
+    esp_err_t err = esp_http_client_open(c, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "GET open failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(c);
+        return err;
+    }
 
-        if (status == 200 && rb.buf) {
-            // Trim any trailing NUL already set in handler
-            *out_body = rb.buf;
-            rb.buf = NULL; // hand off ownership
+    int64_t cl = esp_http_client_fetch_headers(c); // may be -1 (chunked)
+
+    int cap = (cl > 0 && cl < 32768) ? (int)cl + 1 : 4096;
+    char *buf = malloc(cap);
+    if (!buf) { esp_http_client_close(c); esp_http_client_cleanup(c); return ESP_ERR_NO_MEM; }
+
+    int total = 0;
+    while (1) {
+        if (total >= cap - 1) {
+            int newcap = cap * 2;
+            if (newcap > 65536) break; // safety
+            char *nb = realloc(buf, newcap);
+            if (!nb) break;
+            buf = nb; cap = newcap;
+        }
+        int n = esp_http_client_read(c, buf + total, cap - 1 - total);
+        if (n <= 0) break;
+        total += n;
+        if (cl > 0 && total >= cl) break;
+    }
+    buf[total] = 0;
+
+    int status = esp_http_client_get_status_code(c);
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+
+    if (status != 200) {
+        ESP_LOGW(TAG, "GET status %d, body: %.*s", status, total, buf);
+        free(buf);
+        return ESP_FAIL;
+    }
+
+    *out = buf;
+    return ESP_OK;
+}
+
+// ======== Command parse & dispatch ========
+typedef struct {
+    bool   valid;
+    bool   on;
+    uint8_t r, g, b;
+    uint8_t brightness;    // 0..255
+    char   id[64];         // commandId or hash
+    char   target[64];     // deviceId/targetId/nodeId
+} gw_cmd_t;
+
+static bool parse_hex2(const char *s, uint8_t *out) {
+    int v = 0;
+    for (int i=0;i<2;i++){
+        char c = s[i];
+        int d = (c>='0'&&c<='9')?c-'0':(c>='a'&&c<='f')?c-'a'+10:(c>='A'&&c<='F')?c-'A'+10:-1;
+        if (d<0) return false;
+        v = (v<<4)|d;
+    }
+    *out = (uint8_t)v; return true;
+}
+
+static gw_cmd_t parse_command_json(const char *json)
+{
+    gw_cmd_t out = {0};
+    cJSON *root = cJSON_Parse(json);
+    if (!root) return out;
+
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(root, "commandId");
+    if (cJSON_IsString(jid) && jid->valuestring && jid->valuestring[0]) {
+        strlcpy(out.id, jid->valuestring, sizeof(out.id));
+    } else {
+        char h[9]; hex32(fnv1a32(json, strlen(json)), h);
+        strlcpy(out.id, h, sizeof(out.id));
+    }
+
+    const char *tkeys[] = {"deviceId","targetId","nodeId"};
+    for (size_t i=0;i<sizeof(tkeys)/sizeof(tkeys[0]);++i){
+        const cJSON *jt = cJSON_GetObjectItemCaseSensitive(root, tkeys[i]);
+        if (cJSON_IsString(jt) && jt->valuestring && jt->valuestring[0]) {
+            strlcpy(out.target, jt->valuestring, sizeof(out.target));
+            break;
+        }
+    }
+    if (out.target[0] == 0) strlcpy(out.target, "all", sizeof(out.target));
+
+    bool have_cmd = false;
+    const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "command");
+    const cJSON *act = cJSON_GetObjectItemCaseSensitive(root, "action");
+    const char *cs = (cJSON_IsString(cmd)?cmd->valuestring:NULL);
+    const char *as = (cJSON_IsString(act)?act->valuestring:NULL);
+    const char *s = cs ? cs : as;
+    if (s) {
+        if (!strcasecmp(s, "on") || !strcasecmp(s, "led_on")) { out.on = true; have_cmd = true; }
+        else if (!strcasecmp(s, "off") || !strcasecmp(s, "led_off")) { out.on = false; have_cmd = true; }
+    } else {
+        have_cmd = true; out.on = true;
+    }
+
+    int b = 255;
+    const cJSON *jb = cJSON_GetObjectItemCaseSensitive(root, "brightness");
+    if (cJSON_IsNumber(jb)) {
+        int v = (int)jb->valuedouble;
+        if (v >= 0 && v <= 100) { b = (v * 255) / 100; }
+        else { if (v < 0) v = 0; if (v > 255) v = 255; b = v; }
+    }
+    out.brightness = (uint8_t)b;
+
+    out.r = out.g = out.b = 0xFF;
+    const cJSON *jc = cJSON_GetObjectItemCaseSensitive(root, "color");
+    if (cJSON_IsString(jc) && jc->valuestring && jc->valuestring[0]) {
+        const char *csz = jc->valuestring;
+        if (csz[0]=='#' && strlen(csz)>=7) {
+            uint8_t r,g,bb;
+            if (parse_hex2(csz+1,&r) && parse_hex2(csz+3,&g) && parse_hex2(csz+5,&bb)) {
+                out.r=r; out.g=g; out.b=bb;
+            }
         }
     }
 
-    esp_http_client_cleanup(client);
-    if (rb.buf) free(rb.buf);
-    return err;
+    out.valid = have_cmd;
+    cJSON_Delete(root);
+    return out;
 }
 
-#if CONFIG_GW_ENABLE_STATUS
-// -------- optional status POST (guarded) --------
-static esp_err_t http_post_json(const char *url, const char *api_key, const char *json_body, int *out_status)
+// ======== Poller (runs only when STA has IP) ========
+static TaskHandle_t s_poll_task = NULL;
+static char s_last_cmd_id[64] = {0};
+
+static void forward_to_mesh_stub(const gw_cmd_t *c)
 {
-    if (out_status) *out_status = -1;
-
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .method = HTTP_METHOD_POST,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 7000,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return ESP_FAIL;
-
-    if (api_key && api_key[0] != '\0') {
-        esp_http_client_set_header(client, "x-api-key", api_key);
-    }
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Cache-Control", "no-cache");
-
-    esp_http_client_set_post_field(client, json_body, strlen(json_body));
-    esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) {
-        if (out_status) *out_status = esp_http_client_get_status_code(client);
-    }
-    esp_http_client_cleanup(client);
-    return err;
+    ESP_LOGI(TAG, "→ MESH target[%s]: %s R:%u G:%u B:%u BRI:%u ID:%s",
+             c->target, c->on ? "ON" : "OFF", c->r, c->g, c->b, c->brightness, c->id);
 }
-#endif // CONFIG_GW_ENABLE_STATUS
-
-// -------- polling task --------
-#define POLL_MS 1500
 
 static void poll_task(void *arg)
 {
-    ESP_LOGI(TAG, "Gateway polling started (deviceId='%s')", GW_DEVICE_ID);
+    ESP_LOGI(TAG, "[POLL] task running (STA connected).");
+    char *body = NULL;
 
     while (1) {
-        char url[512];
-        // Append deviceId as query (Lambda/S3 may ignore it, safe to send)
-        snprintf(url, sizeof(url), "%s?deviceId=%s", GW_URL_LATEST, GW_DEVICE_ID);
+        body = NULL;
+        if (http_get(GW_URL_LATEST, GW_API_KEY, &body) == ESP_OK && body) {
+            char *p = body; while (*p && isspace((unsigned char)*p)) ++p;
+            if (*p) {
+                ESP_LOGI(TAG, "latest-command: %s", p);
 
-        char *body = NULL;
-        int http_status = -1;
-        esp_err_t err = http_get(url, GW_API_KEY, &body, &http_status);
-
-        if (err == ESP_OK && http_status == 200) {
-            if (body && body[0] != '\0') {
-                ESP_LOGI(TAG, "latest-command: %s", body);
-                // TODO: parse JSON and forward to BLE Mesh here
+                gw_cmd_t c = parse_command_json(p);
+                if (c.valid && strcmp(s_last_cmd_id, c.id) != 0) {
+                    strlcpy(s_last_cmd_id, c.id, sizeof(s_last_cmd_id));
+                    forward_to_mesh_stub(&c);
+                }
             } else {
-                // empty body is fine ??? nothing queued
-                // ESP_LOGD(TAG, "No command at the moment");
+                ESP_LOGI(TAG, "latest-command:");
             }
-        } else {
-            ESP_LOGW(TAG, "GET status %d (err=%d)", http_status, (int)err);
+            free(body);
         }
-
-        if (body) free(body);
-
-        // ---------- OPTIONAL STATUS (disabled unless enabled in menuconfig) ----------
-#if CONFIG_GW_ENABLE_STATUS
-        // Build a tiny heartbeat/ack as needed; example payload:
-        // {"gatewayId":"%s","status":"online"}
-        char status_body[160];
-        snprintf(status_body, sizeof(status_body),
-                 "{\"gatewayId\":\"%s\",\"status\":\"online\"}", GW_DEVICE_ID);
-
-        int post_status = -1;
-        err = http_post_json(GW_URL_STATUS, GW_API_KEY, status_body, &post_status);
-        if (err == ESP_OK) {
-            if (post_status != 200) {
-                ESP_LOGW(TAG, "POST status %d", post_status);
-            }
-        } else {
-            ESP_LOGW(TAG, "POST failed (err=%d)", (int)err);
-        }
-#endif
-        // ---------------------------------------------------------------------------
-
-        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
 
-// -------- app_main --------
+static void start_poll_task_if_needed(void)
+{
+    if (!s_poll_task) {
+        xTaskCreatePinnedToCore(poll_task, "poll", 4096, NULL, 5, &s_poll_task, 0);
+        ESP_LOGI(TAG, "[POLL] CREATED");
+    }
+}
+static void stop_poll_task_if_running(void)
+{
+    if (s_poll_task) {
+        vTaskDelete(s_poll_task);
+        s_poll_task = NULL;
+        ESP_LOGI(TAG, "[POLL] DELETED");
+    }
+}
+
+static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, void* data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "STA disconnected -> stop poller");
+        stop_poll_task_if_running();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "STA got IP -> start poller");
+        start_poll_task_if_needed();
+    }
+}
+
+// ======== app_main ========
 void app_main(void)
 {
-    // NVS & netif init
+    ESP_LOGI(TAG, "BUILD MARK: GPIO0 long-press erase | GET-only poller");
+
+    // NVS (must succeed for Wi-Fi creds to persist)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
+        nvs_flash_erase();
+        nvs_flash_init();
     }
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Start Wi-Fi manager (provisions if no creds; uses saved creds otherwise)
+    // Event loop + Wi-Fi events (for poller gating)
+    esp_event_loop_create_default();
+    esp_event_handler_instance_t h1, h2;
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &h1);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &h2);
+
+    // Start button monitor (GPIO0 long-press)
+    xTaskCreatePinnedToCore(wifi_clear_button_task, "btn", 2048, NULL, 10, NULL, 0);
+
+    // Start Wi-Fi manager (keeps creds; we’re NOT erasing anywhere at boot)
     ESP_LOGI(TAG, "Gateway starting: Wi-Fi manager init");
-    wifi_manager_start();
+    wifi_manager_start();  // NOTE: this returns void in your project
 
-    ESP_LOGI(TAG, "HTTPS cert bundle enabled"); // using esp_crt_bundle_attach
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+    ESP_LOGI(TAG, "HTTPS cert bundle enabled");
+#endif
 
-    // Start the polling task
-    xTaskCreate(poll_task, "poll_task", 6 * 1024, NULL, 5, NULL);
+    ESP_LOGI("main_task", "Returned from app_main()");
 }
-
-
